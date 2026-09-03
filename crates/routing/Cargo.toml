@@ -18,3 +18,4 @@ tonic = { workspace = true }
 [dev-dependencies]
 parking_lot = { workspace = true }
 tokio = { workspace = true }
+scg-store-memory = { path = "../store-memory" }

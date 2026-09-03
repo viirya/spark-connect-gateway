@@ -2,7 +2,7 @@
 //! Spark Connect backends. Validates forwarding semantics without needing a
 //! real Spark distribution.
 //!
-//! Four scenarios:
+//! Five scenarios:
 //!
 //! 1. Unary RPC forwarding (`Config`).
 //! 2. Server-streaming forwarding emits all upstream messages (`ExecutePlan`).
@@ -10,6 +10,8 @@
 //!    different sessions are interleaved).
 //! 4. Op-id reverse index — `ReattachExecute` with a *different* `session_id`
 //!    still routes to the backend that handled the original `ExecutePlan`.
+//! 5. `CloneSession` pins `new_session_id` to the parent's backend so a
+//!    follow-up RPC stays sticky on multi-backend deployments.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -144,9 +146,17 @@ impl pb::spark_connect_service_server::SparkConnectService for FakeBackend {
     }
     async fn clone_session(
         &self,
-        _: Request<pb::CloneSessionRequest>,
+        req: Request<pb::CloneSessionRequest>,
     ) -> Result<Response<pb::CloneSessionResponse>, Status> {
-        Err(Status::unimplemented("not used in tests"))
+        let body = req.into_inner();
+        // Echo a stable new_session_id so the gateway can pin it; tag the
+        // server-side id with this backend so tests can assert affinity.
+        Ok(Response::new(pb::CloneSessionResponse {
+            session_id: body.session_id,
+            new_session_id: "cloned".into(),
+            new_server_side_session_id: format!("ssid@{}", self.id),
+            ..Default::default()
+        }))
     }
     async fn get_status(
         &self,
@@ -368,5 +378,57 @@ async fn reattach_routes_via_op_id_even_with_different_session_id() {
         original_suffix, reattach_suffix,
         "reattach landed on the wrong backend (orig {:?}, reattach {:?})",
         original_suffix, reattach_suffix
+    );
+}
+
+#[tokio::test]
+async fn clone_session_followup_is_sticky() {
+    let a = start_backend("A").await;
+    let b = start_backend("B").await;
+    let gw = start_gateway(vec![a.addr.clone(), b.addr.clone()]).await;
+
+    let mut c = client(&gw);
+
+    // Pin the parent session to whichever backend the pool picks first.
+    let parent = c
+        .config(pb::ConfigRequest {
+            session_id: "orig".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let parent_tag = parent.session_id; // "orig@A" or "orig@B"
+    let parent_suffix = parent_tag["orig".len()..].to_string(); // "@A" or "@B"
+
+    // Clone it; mock returns new_session_id = "cloned".
+    let resp = c
+        .clone_session(pb::CloneSessionRequest {
+            session_id: "orig".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.new_session_id, "cloned");
+    assert_eq!(
+        resp.new_server_side_session_id,
+        format!("ssid{}", parent_suffix),
+        "CloneSession must land on the parent's backend"
+    );
+
+    // Follow-up on the cloned session must stick to the same backend.
+    let followup = c
+        .config(pb::ConfigRequest {
+            session_id: "cloned".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        followup.session_id,
+        format!("cloned{}", parent_suffix),
+        "cloned session follow-up must stay on the parent's backend"
     );
 }
